@@ -10,7 +10,7 @@
 //   /output/dossier.json  the dossier the judge reads, built by the vendored make.fun library
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <path-to-kit>/input/snapshot.json
 //
 // The run is deterministic: same snapshot in, same bytes out. Run it twice and diff the
 // directories; nothing in the output carries a clock, a random value, or a file order that
