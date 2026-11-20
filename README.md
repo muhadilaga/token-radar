@@ -8,10 +8,10 @@ Token Radar ranks 198 clean pre-token DeFi launches by implied launch value, sco
 
 ## Run it
 
-The snapshot is the competition's sealed input: place the kit's `input/snapshot.json` at `./input/snapshot.json`, then:
+The snapshot is the competition's sealed input and is not shipped in this repository: the grader mounts it at `/input/snapshot.json`, which is also where `main.ts` reads it by default. To run it yourself, point `--input` at the kit's snapshot:
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ./input/snapshot.json
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <path-to-kit>/input/snapshot.json
 ```
 
 Node 22.18 or later, standard library only, nothing to install. The run writes `out/board.json`, `out/data.js`, `out/dashboard/`, `out/screenshots/` and `out/dossier.json`. It is deterministic: run it twice and the directories are byte-identical.
