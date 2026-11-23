@@ -330,7 +330,7 @@
     var m = DATA.model;
     return el('section', { class: 'panel section' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'note', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'note', text: 'Every row is scored by one function of three snapshot figures only — TVL, seven-day growth and age — with no token on record, no protocol name special-cased, and no row hand-picked; live-token protocols are shown at market value, never ranked.' }),
       el('div', { class: 'formula' },
         el('b', { text: 'implied = round( ' }),
         'tvl ^ ' + m.size_power + ' x ' + m.size_scale + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_peak + ' x exp(-((age - ' + m.maturity_peak_days + ') / ' + m.maturity_spread_days + ')^2)) x (1 + ' + m.chain_bonus + ' x min(chains - 1, ' + m.chain_bonus_cap + ')) x derivative',

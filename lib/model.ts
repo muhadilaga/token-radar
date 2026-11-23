@@ -480,7 +480,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const hold = holdDaysFor(age);
   return [
     {
-      text: 'Open a fresh wallet for this farm only, fund it with the capital below, and keep its seed phrase offline.',
+      text: `Open a fresh wallet for this farm only, fund it on ${chain} with $${capital} for this farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
@@ -500,12 +500,12 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: `${hold} days`,
     },
     {
-      text: "Before you touch a withdrawal, open the protocol's own points or rewards page and claim only through the link it publishes.",
+      text: `Before you touch a withdrawal, open ${p.name}'s own points or rewards page and claim only through the link it publishes.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
     {
-      text: 'Write the wallet, the dates and every transaction hash in a farm log, then plan the unwind before the token launches.',
+      text: `Write the wallet, the dates and every transaction hash for ${p.name} in a farm log, then plan the unwind before the token launches.`,
       cost: 'nothing but the log',
       time: '5 minutes',
     },
