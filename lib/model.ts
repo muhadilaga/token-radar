@@ -146,6 +146,15 @@ export interface RadarRow {
   chain_multiplier: number;
   derivative_multiplier: number;
   farm_steps: string[];
+  /** Per-row interpretation, board rows only (see buildRowContexts): category standing,
+   * growth and age percentiles, the factor carrying the rank, and one sentence saying so.
+   * Derivative rows carry no context. */
+  catRank?: number;
+  catSize?: number;
+  growthPct?: number | null;
+  agePct?: number | null;
+  dominant?: 'size' | 'growth' | 'maturity' | 'chain';
+  why?: string;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -469,8 +478,108 @@ function weeklyActionFor(p: SnapshotProtocol): string {
   }
 }
 
+/** A number with at most two decimals, trailing zeros trimmed: 10.26, 25.5, 20. */
+function fmtNum(n: number): string {
+  return String(Math.round(n * 100) / 100);
+}
+
+/** Gas cost strings for one farm's first, setup and weekly transactions, by first chain. */
+export interface GasTier {
+  first: string;
+  setup: string;
+  weekly: string;
+}
+
+const GAS_ETH: GasTier = {
+  first: 'about $5 to $20 of gas for the first transaction',
+  setup: 'about $5 to $20 of gas',
+  weekly: 'about $10 to $40 of gas a week',
+};
+const GAS_L2: GasTier = {
+  first: 'under $1 of gas for the first transaction',
+  setup: 'under $1 of gas',
+  weekly: 'under $2 of gas a week',
+};
+const GAS_CHEAP_L1: GasTier = {
+  first: 'under $0.50 of gas for the first transaction',
+  setup: 'under $0.50 of gas',
+  weekly: 'under $1 of gas a week',
+};
+const GAS_TRON: GasTier = {
+  first: 'about $1 to $3 of gas for the first transaction',
+  setup: 'about $1 to $3 of gas',
+  weekly: 'about $2 to $5 of gas a week',
+};
+const GAS_FALLBACK: GasTier = {
+  first: 'under $3 of gas for the first transaction',
+  setup: 'under $3 of gas',
+  weekly: 'about $2 of gas a week',
+};
+
+const GAS_L2_CHAINS = new Set([
+  'arbitrum', 'optimism', 'base', 'ink', 'unichain', 'katana', 'mantle', 'blast', 'linea', 'scroll',
+  'zksync', 'zksync era', 'mode', 'fraxtal',
+]);
+const GAS_CHEAP_L1_CHAINS = new Set([
+  'solana', 'sui', 'aptos', 'near', 'avalanche', 'bsc', 'polygon', 'gnosis', 'fantom', 'celo',
+]);
+
+/** The gas tier of a protocol's first chain, by lowercase name. The snapshot spells BNB
+ * Chain as "Binance" and zkSync as "zkSync Era", so those spellings map to their tiers too;
+ * any chain with no tier falls back to the old flat figures rather than a guessed fee. */
+export function gasFor(chain: string): GasTier {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return GAS_ETH;
+  if (c === 'tron') return GAS_TRON;
+  if (c === 'bnb chain' || c === 'binance smart chain' || c === 'binance') return GAS_CHEAP_L1;
+  if (GAS_L2_CHAINS.has(c)) return GAS_L2;
+  if (GAS_CHEAP_L1_CHAINS.has(c)) return GAS_CHEAP_L1;
+  return GAS_FALLBACK;
+}
+
+/** What can go wrong with this kind of farm, one line per family. */
+export function riskFor(family: string): string {
+  switch (family) {
+    case 'staking':
+      return "Staking risk: the receipt token can trade below the staked asset, and unbonding can take days.";
+    case 'bridge':
+      return 'Bridge risk: a bridge holds the funds it moves — a bridge failure can strand them.';
+    case 'lending':
+      return 'Lending risk: a sharp fall in collateral can liquidate the position — borrow far less than you supply.';
+    case 'dex':
+      return 'Dex risk: impermanent loss — if one side of the pair moves far, the LP can end worth less than holding.';
+    case 'perps':
+      return 'Perps risk: leverage cuts both ways, and funding can bleed a hedged position — keep the position small.';
+    case 'prediction':
+      return 'Prediction risk: a market can resolve against you in full — never stake more than you can afford to lose.';
+    case 'vault':
+      return "Vault risk: the curator's strategy can lose value, and the vault's holdings are the curator's choice — read them first.";
+    case 'stable':
+      return "Stable risk: a peg can break — watch the stable asset's price and the backing it claims.";
+    case 'rwa':
+      return 'RWA risk: the yield depends on an off-chain issuer and custodian — the token is only as sound as they are.';
+    case 'insurance':
+      return 'Insurance risk: a claim can be denied — read what the cover actually pays before you buy it.';
+    case 'yield':
+      return "Yield risk: the strategy's yield can fall, or the underlying can be exploited — check where the yield comes from.";
+    default:
+      return "Risk: a smart-contract bug can take the deposit — this protocol's code is the only backstop.";
+  }
+}
+
+/** When to stop adding to this farm, from the row's own seven-day growth. */
+export function tripwireFor(growth: number | null): string {
+  if (growth !== null && growth < -5) {
+    return `TVL is down ${fmtNum(Math.abs(growth))}% in the last week, so farm small and re-check in 7 days before adding more.`;
+  }
+  if (growth !== null && growth > 20) {
+    return `TVL is up ${fmtNum(growth)}% in the last week, but one week is not a trend — re-check before adding more.`;
+  }
+  return 'If TVL falls 20% in a week, the premise weakens — re-check before topping up.';
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived
+ * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list
  * of names. It is a plan for qualifying activity, not a promise of any allocation.
  */
@@ -478,20 +587,21 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const gas = gasFor(chain);
   return [
     {
       text: `Open a fresh wallet for this farm only, fund it on ${chain} with $${capital} for this farm, and keep its seed phrase offline.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: gas.first,
       time: '5 minutes',
     },
     {
       text: mainActionFor(p, capital, chain),
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and ${gas.setup}`,
       time: '15 minutes to set up',
     },
     {
       text: weeklyActionFor(p),
-      cost: 'about $2 of gas a week',
+      cost: gas.weekly,
       time: '10 minutes a week',
     },
     {
@@ -507,6 +617,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     {
       text: `Write the wallet, the dates and every transaction hash for ${p.name} in a farm log, then plan the unwind before the token launches.`,
       cost: 'nothing but the log',
+      time: '5 minutes',
+    },
+    {
+      text: `Know the risk and when to stop: ${riskFor(familyOf(p))} ${tripwireFor(p.change_7d)}`,
+      cost: 'nothing to check',
       time: '5 minutes',
     },
   ];
@@ -529,8 +644,127 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-/** A board row's compact form for data.js, farm plan included. */
-export function radarRow(row: BoardRow): RadarRow {
+/** Per-row interpretation of the board, computed from the snapshot alone: category standing,
+ * growth and age percentiles, the factor carrying the rank, and one sentence saying so. */
+export interface RowContext {
+  catRank: number;
+  catSize: number;
+  growthPct: number | null;
+  agePct: number | null;
+  dominant: 'size' | 'growth' | 'maturity' | 'chain';
+  why: string;
+}
+
+/** Short dollars, mirroring the dashboard's fmtUsd: $2.75B, $405.3M, $97.4M. */
+function fmtUsdShort(n: number): string {
+  if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+  if (Math.abs(n) >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+  if (Math.abs(n) >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
+  return '$' + Math.round(n);
+}
+
+/** Short age, mirroring the dashboard's fmtAge: 1.5y, 214d, unknown. */
+function fmtAgeShort(days: number | null): string {
+  if (days === null) return 'unknown';
+  if (days >= 365) return (days / 365).toFixed(1) + 'y';
+  return Math.max(0, Math.round(days)) + 'd';
+}
+
+/** A signed growth figure with two decimals, mirroring the dashboard's fmtPct: +26.30, -10.26. */
+function fmtGrowthVal(n: number): string {
+  return (n > 0 ? '+' : '') + n.toFixed(2);
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+}
+
+/** The share of `set` strictly smaller than `value`, as a whole percent. */
+function percentile(value: number, set: number[]): number {
+  return Math.round((set.filter((v) => v < value).length / set.length) * 100);
+}
+
+/** The one sentence that interprets a row's rank. Every clause comes from computed fields;
+ * a driver whose clause cannot be stated truthfully (null growth or age, a single chain, a
+ * falling growth) falls back to the size sentence with the clauses that exist. */
+function whySentence(
+  row: BoardRow,
+  ctx: { catRank: number; catSize: number; growthPct: number | null; agePct: number | null; dominant: RowContext['dominant'] },
+  medianTvl: number,
+): string {
+  const tvl = fmtUsdShort(row.tvl_usd);
+  const category = row.category ?? 'Other';
+  if (ctx.dominant === 'growth' && row.change_7d !== null && row.change_7d > 0 && ctx.growthPct !== null) {
+    const tvlPhrase = row.tvl_usd > medianTvl ? `, on ${tvl} of TVL` : '';
+    return `Growth carries this rank: ${fmtGrowthVal(row.change_7d)}% in seven days beats ${ctx.growthPct}% of the board${tvlPhrase}.`;
+  }
+  if (ctx.dominant === 'maturity' && row.age_days !== null && Math.abs(row.age_days - 730) < 400) {
+    return `Age carries this rank: ${fmtAgeShort(row.age_days)} with no token sits near the model's two-year peak, on ${tvl} of TVL.`;
+  }
+  if (ctx.dominant === 'chain' && row.chains.length > 1) {
+    return `Breadth carries this rank: ${row.chains.length} chains lift the value by x${row.model.chain_multiplier.toFixed(2)}, on ${tvl} of TVL.`;
+  }
+  const ageNearPeak = row.age_days !== null && Math.abs(row.age_days - 730) < 400;
+  const ageClause = ageNearPeak ? `, and its ${fmtAgeShort(row.age_days)} age sits near the model's two-year peak` : '';
+  return `Size carries this rank: ${tvl} is #${ctx.catRank} of ${ctx.catSize} ${category} on the board${ageClause}.`;
+}
+
+/** A context for every board row. `dominant` is the factor whose value stands furthest above
+ * the board median, over size value and the three multipliers; ties keep the earlier factor
+ * (size, then growth, then maturity, then chain). */
+export function buildRowContexts(board: BoardRow[]): Map<string, RowContext> {
+  const medSize = median(board.map((r) => r.model.size_value));
+  const medGrowth = median(board.map((r) => r.model.growth_multiplier));
+  const medMaturity = median(board.map((r) => r.model.maturity_multiplier));
+  const medChain = median(board.map((r) => r.model.chain_multiplier));
+  const medianTvl = median(board.map((r) => r.tvl_usd));
+  const growthSet = board.filter((r) => r.change_7d !== null).map((r) => r.change_7d as number);
+  const ageSet = board.filter((r) => r.age_days !== null).map((r) => r.age_days as number);
+  const byCategory = new Map<string, BoardRow[]>();
+  for (const r of board) {
+    const cat = r.category ?? 'Other';
+    const list = byCategory.get(cat) ?? [];
+    list.push(r);
+    byCategory.set(cat, list);
+  }
+  const contexts = new Map<string, RowContext>();
+  for (const r of board) {
+    const cat = r.category ?? 'Other';
+    const siblings = [...(byCategory.get(cat) ?? [])].sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const catRank = siblings.findIndex((s) => s.slug === r.slug) + 1;
+    const growthPct = r.change_7d === null ? null : percentile(r.change_7d, growthSet);
+    const agePct = r.age_days === null ? null : percentile(r.age_days, ageSet);
+    const ratios = {
+      size: r.model.size_value / medSize,
+      growth: r.model.growth_multiplier / medGrowth,
+      maturity: r.model.maturity_multiplier / medMaturity,
+      chain: r.model.chain_multiplier / medChain,
+    };
+    let dominant: RowContext['dominant'] = 'size';
+    let best = ratios.size;
+    if (ratios.growth > best) {
+      dominant = 'growth';
+      best = ratios.growth;
+    }
+    if (ratios.maturity > best) {
+      dominant = 'maturity';
+      best = ratios.maturity;
+    }
+    if (ratios.chain > best) {
+      dominant = 'chain';
+      best = ratios.chain;
+    }
+    const partial = { catRank, catSize: siblings.length, growthPct, agePct, dominant };
+    contexts.set(r.slug, { ...partial, why: whySentence(r, partial, medianTvl) });
+  }
+  return contexts;
+}
+
+/** A board row's compact form for data.js, farm plan included. The context, when given,
+ * is the row's interpretation from buildRowContexts(); derivative rows carry none. */
+export function radarRow(row: BoardRow, context?: RowContext): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -550,12 +784,19 @@ export function radarRow(row: BoardRow): RadarRow {
     chain_multiplier: row.model.chain_multiplier,
     derivative_multiplier: row.model.derivative_multiplier,
     farm_steps: row.farm_steps,
+    catRank: context?.catRank,
+    catSize: context?.catSize,
+    growthPct: context ? context.growthPct : undefined,
+    agePct: context ? context.agePct : undefined,
+    dominant: context?.dominant,
+    why: context?.why,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
+  const contexts = buildRowContexts(board);
   const live = liveRows(snapshot);
   const derivatives = derivativeRows(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
@@ -572,7 +813,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     derivative_size: derivatives.length,
-    rows: board.map(radarRow),
+    rows: board.map((r) => radarRow(r, contexts.get(r.slug))),
     live,
     derivatives,
   };

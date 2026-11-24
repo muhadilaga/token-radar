@@ -336,7 +336,8 @@
         'tvl ^ ' + m.size_power + ' x ' + m.size_scale + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_peak + ' x exp(-((age - ' + m.maturity_peak_days + ') / ' + m.maturity_spread_days + ')^2)) x (1 + ' + m.chain_bonus + ' x min(chains - 1, ' + m.chain_bonus_cap + ')) x derivative',
         el('b', { text: ' )' })
       ),
-      el('p', { class: 'note', text: 'Size is sub-linear: doubling locked value does not double launch value. Growth is clamped, so one wild week cannot carry a row. Maturity is a hump that peaks around two years of track record: very young is unproven, very old has likely decided not to launch. Breadth across chains adds a little. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + m.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + m.unknown_age_days + ' days.' })
+      el('p', { class: 'note', text: 'Size is sub-linear: doubling locked value does not double launch value. Growth is clamped, so one wild week cannot carry a row. Maturity is a hump that peaks around two years of track record: very young is unproven, very old has likely decided not to launch. Breadth across chains adds a little. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + m.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('p', { class: 'note', text: 'The snapshot carries no team, funding or points-program data, so the model cannot score them. Size and age dominate the top of the board, so the largest vaults and curators lead it; the category filter is how a reader compares within one kind of protocol.' })
     );
   }
 
@@ -388,6 +389,9 @@
       out.appendChild(el('ol', null, ranked.map(function (x, i) {
         return el('li', null, el('b', { text: '#' + (i + 1) + ' ' + x.row.name + ' ' }), fmtUsd(x.value) + ' (board rank ' + x.row.rank + ')');
       })));
+      var defaultTop = DATA.rows.slice(0, 10).map(function (r) { return r.slug; });
+      var changed = ranked.filter(function (x) { return defaultTop.indexOf(x.row.slug) < 0; }).length;
+      out.appendChild(el('p', { class: 'note', text: changed + ' of the top 10 change under these constants.' }));
     }
     var reset = el('button', { class: 'button', type: 'button', text: 'Reset to defaults', onclick: function () {
       sandbox = null;
@@ -439,6 +443,23 @@
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
+    if (row.why) {
+      var cat = row.category || 'Other';
+      var growthLine = row.growthPct === null || row.growthPct === undefined
+        ? 'Seven-day growth: not reported.'
+        : 'Seven-day growth: stronger than ' + row.growthPct + '% of the board.';
+      var ageLine;
+      if (row.agePct === null || row.agePct === undefined) ageLine = 'Age: not reported.';
+      else if (row.agePct < 50) ageLine = 'Age: younger than ' + (100 - row.agePct) + '% of the board.';
+      else ageLine = 'Age: older than ' + row.agePct + '% of the board.';
+      dialog.appendChild(el('section', { class: 'detail-section' },
+        el('h3', { text: 'In context' }),
+        el('p', { text: row.why }),
+        el('p', { class: 'sub', text: 'TVL #' + row.catRank + ' of ' + row.catSize + ' ' + cat + ' on this board.' }),
+        el('p', { class: 'sub', text: growthLine }),
+        el('p', { class: 'sub', text: ageLine })
+      ));
+    }
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
       el('ol', { class: 'steps' }, (row.farm_steps || []).map(function (s) {
