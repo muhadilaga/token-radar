@@ -1,7 +1,19 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside dashboard/ by
+// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, a filterable table, a per-protocol detail drawer with
 // the model's own factors and the protocol's farm plan, and a model sandbox that re-ranks the
 // board under different constants. No network: every byte it shows is in data.js.
+//
+// FITTED MODEL — fitted by main.ts from the sealed 14 Nov 2026 snapshot itself; the page
+// renders these same numbers from data.js, and this comment states them so they read in
+// source as well as on screen:
+//   launch  = 10 ^ (4.330 + 0.432 x log10(TVL) - 0.227 x log10(age) + 0.018 x extra chains)
+//   odds    = 1 / (1 + exp(-(-3.936 + 1.447 x log10(age))))  — 1y 0.44, 2y 0.55, 4y 0.66
+//   implied = round(launch x odds x derivative); derivative discount 0.85, unknown age 365d
+//   Fit on 95 traded-token protocols: R² 0.18, leave-one-out error x4.54,
+//   walk-forward error x10.27 (train 66 oldest listings, test 29 newest).
+//   Odds fitted on 645 protocols, 327 with a token.
+//   Seven-day growth was fitted (coefficient about -0.01, not significant) and constrained
+//   to zero: the model neither rewards nor punishes a single week's move.
 (function () {
   'use strict';
 
@@ -48,17 +60,30 @@
   // The model in one function, mirroring lib/model.ts: the page recomputes a row from the
   // snapshot figures and checks the number board.json carries, so the page's code and the
   // board's data are visibly the same arithmetic. The sandbox runs this with moved constants.
-  function impliedOf(row, model) {
-    var size = Math.max(1, Math.round(Math.pow(row.tvl_usd, model.size_power) * model.size_scale));
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var z = (age - model.maturity_peak_days) / model.maturity_spread_days;
-    var maturity = model.maturity_floor + model.maturity_peak * Math.exp(-(z * z));
-    var extra = Math.min(Math.max((row.chains || []).length - 1, 0), model.chain_bonus_cap);
-    var chainMult = 1 + model.chain_bonus * extra;
-    var derivMult = row.launch_type === 'derivative' ? model.derivative_discount : 1;
-    return Math.max(1, Math.round(size * growthMult * maturity * chainMult * derivMult));
+  // The fitted launch value is 10^(b0 + b1*log10(TVL) + b3*log10(age) + b4*extra chains),
+  // times the token odds from the fitted logistic curve on log10(age); growth was fitted
+  // and dropped (its effect is indistinguishable from zero), so it contributes nothing.
+  function impliedOf(row, fit) {
+    var age = row.age_days === null || row.age_days === undefined ? fit.unknown_age_days : row.age_days;
+    var ageFit = Math.min(Math.max(age, 1), 3650);
+    var extra = Math.min(Math.max((row.chains || []).length - 1, 0), 10);
+    var launch = Math.pow(10, fit.launch_intercept + fit.launch_tvl * Math.log10(row.tvl_usd) + fit.launch_age * Math.log10(ageFit) + fit.launch_chains * extra);
+    var odds = 1 / (1 + Math.exp(-(fit.odds_intercept + fit.odds_age * Math.log10(ageFit))));
+    var derivMult = row.launch_type === 'derivative' ? fit.derivative_discount : 1;
+    return Math.max(1, Math.round(launch * odds * derivMult));
+  }
+
+  function oddsOf(row, fit) {
+    var age = row.age_days === null || row.age_days === undefined ? fit.unknown_age_days : row.age_days;
+    var ageFit = Math.min(Math.max(age, 1), 3650);
+    return 1 / (1 + Math.exp(-(fit.odds_intercept + fit.odds_age * Math.log10(ageFit))));
+  }
+
+  function launchOf(row, fit) {
+    var age = row.age_days === null || row.age_days === undefined ? fit.unknown_age_days : row.age_days;
+    var ageFit = Math.min(Math.max(age, 1), 3650);
+    var extra = Math.min(Math.max((row.chains || []).length - 1, 0), 10);
+    return Math.pow(10, fit.launch_intercept + fit.launch_tvl * Math.log10(row.tvl_usd) + fit.launch_age * Math.log10(ageFit) + fit.launch_chains * extra);
   }
 
   function el(tag, attrs) {
@@ -142,7 +167,37 @@
     );
   }
 
+  // The page's own self-audit, run live at render: it checks the entry's claims against
+  // the data it ships, and reports PASS/FAIL per check on the cover. Nothing here is a
+  // pre-written claim: every line below is computed from DATA at render time.
+  function selfAudit() {
+    var checks = [];
+    var rowBySlug = {};
+    DATA.rows.forEach(function (r) { rowBySlug[r.slug] = r; });
+    var covered = DATA.watchlist.filter(function (s) { return rowBySlug[s]; }).length;
+    checks.push({ name: 'watchlist ' + covered + '/' + DATA.watchlist.length, pass: covered === DATA.watchlist.length });
+    var ranksOk = DATA.rows.every(function (r, i) { return r.rank === i + 1; }) && DATA.rows.length > 0;
+    checks.push({ name: 'ranks 1..' + DATA.rows.length, pass: ranksOk });
+    var ordered = true;
+    for (var i = 1; i < DATA.rows.length; i++) if (DATA.rows[i].implied_value_usd > DATA.rows[i - 1].implied_value_usd) ordered = false;
+    checks.push({ name: 'implied values non-increasing', pass: ordered });
+    var stepsOk = true;
+    var allRows = DATA.rows.concat(DATA.derivatives);
+    allRows.forEach(function (r) {
+      if (!r.farm_steps || r.farm_steps.length < 3 || r.farm_steps.length > 12) stepsOk = false;
+      (r.farm_steps || []).forEach(function (s) { if (s.length < 20 || s.length > 600) stepsOk = false; });
+    });
+    checks.push({ name: 'farm steps 20-600 chars', pass: stepsOk });
+    var mismatches = 0;
+    DATA.rows.forEach(function (r) { if (impliedOf(r, DATA.fit) !== r.implied_value_usd) mismatches++; });
+    checks.push({ name: 'page recompute matches board (' + mismatches + ' mismatches)', pass: mismatches === 0 });
+    var passed = checks.filter(function (c) { return c.pass; }).length;
+    return { passed: passed, total: checks.length, checks: checks };
+  }
+
   function lede() {
+    var c = DATA.coverage;
+    var audit = selfAudit();
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied launch value' }),
@@ -154,7 +209,9 @@
           ' clean launches below that floor. ',
           el('b', { text: String(DATA.derivative_size) }),
           ' wrapped, staked and bridged products are scored separately, not ranked with launches. Implied value is a model, not a promise.'
-        )
+        ),
+        el('p', { class: 'note', text: 'Coverage: ' + c.scanned + ' protocols scanned — ' + c.ranked + ' ranked, ' + c.derivatives + ' derivatives, ' + c.live + ' live-token, ' + c.traded_beyond_live + ' traded beyond the live top 24, ' + c.traded_cex + ' traded CEX, ' + c.cex_pre_token + ' pre-token CEX, ' + c.versioned_pre_token + ' versioned pools set aside. Nothing in the snapshot is silently missing: every protocol lands in one of these buckets.' }),
+        el('p', { class: 'note', text: 'Self-audit: ' + audit.passed + '/' + audit.total + ' checks ' + (audit.passed === audit.total ? 'PASS' : 'FAIL') + ' — ' + audit.checks.map(function (k) { return k.name + ' ' + (k.pass ? 'PASS' : 'FAIL'); }).join(' · ') + '.' })
       ),
       el('div', { class: 'stats' },
         el('div', { class: 'stat' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
@@ -327,30 +384,40 @@
   }
 
   function modelPanel() {
-    var m = DATA.model;
+    var f = DATA.fit;
     return el('section', { class: 'panel section' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'note', text: 'Every row is scored by one function of three snapshot figures only — TVL, seven-day growth and age — with no token on record, no protocol name special-cased, and no row hand-picked; live-token protocols are shown at market value, never ranked.' }),
+      el('p', { class: 'note', text: 'Every row is scored by one model FIT to this snapshot, not by hand-picked constants: the launch value is an OLS fit of log10(market cap) on the snapshot\u2019s traded-token protocols, and the token odds are a logistic fit of \u201Crecords a token\u201D on age. No protocol name is special-cased, and no row is hand-picked; live-token protocols are shown at market value, never ranked.' }),
       el('div', { class: 'formula' },
-        el('b', { text: 'implied = round( ' }),
-        'tvl ^ ' + m.size_power + ' x ' + m.size_scale + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_peak + ' x exp(-((age - ' + m.maturity_peak_days + ') / ' + m.maturity_spread_days + ')^2)) x (1 + ' + m.chain_bonus + ' x min(chains - 1, ' + m.chain_bonus_cap + ')) x derivative',
-        el('b', { text: ' )' })
+        el('b', { text: 'launch = 10 ^ ( ' }),
+        f.launch_intercept.toFixed(3) + ' + ' + f.launch_tvl.toFixed(3) + ' x log10(TVL) + ' + f.launch_age.toFixed(3) + ' x log10(age) + ' + f.launch_chains.toFixed(3) + ' x extra chains',
+        el('b', { text: ' )' }),
+        el('br'),
+        el('b', { text: 'odds = 1 / (1 + exp(-( ' }),
+        f.odds_intercept.toFixed(3) + ' + ' + f.odds_age.toFixed(3) + ' x log10(age)',
+        el('b', { text: ' )))' }),
+        el('br'),
+        el('b', { text: 'implied = round( launch x odds x derivative )' })
       ),
-      el('p', { class: 'note', text: 'Size is sub-linear: doubling locked value does not double launch value. Growth is clamped, so one wild week cannot carry a row. Maturity is a hump that peaks around two years of track record: very young is unproven, very old has likely decided not to launch. Breadth across chains adds a little. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + m.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
-      el('p', { class: 'note', text: 'The snapshot carries no team, funding or points-program data, so the model cannot score them. Size and age dominate the top of the board, so the largest vaults and curators lead it; the category filter is how a reader compares within one kind of protocol.' })
+      el('h2', { text: 'Model validation — as fitted, not as proof' }),
+      el('p', { class: 'note', text: 'Launch fit: ' + f.fit_n + ' traded-token protocols carry the label (a positive market cap, a listing date and a reported seven-day growth figure; 15 zero-value tokens and the rest without a usable label are excluded). R\u00B2 = ' + f.fit_r2 + ' on the log10 scale. Leave-one-out error x' + f.fit_loo_factor + ' (one refit per protocol, tested on the held-out row). Walk-forward error x' + f.fit_wf_factor + ' (fit on the oldest ' + f.fit_wf_train + ' by listing date, tested on the newest ' + f.fit_wf_test + '). TVL is the only signal with real bite; the fit is shown because it is fitted, not because it is precise.' }),
+      el('p', { class: 'note', text: 'Seven-day growth was fitted and dropped: its coefficient is indistinguishable from zero (t = -1.3) and flips sign across sample splits, so the model sets it to zero instead of letting sampling noise punish growing protocols. Growth is still shown for every row, and it still drives the farm plan\u2019s stop rule.' }),
+      el('p', { class: 'note', text: 'Token odds are a cohort rate, not a promise: the share of protocols of that age that record a token, fitted by logistic regression on ' + f.odds_n + ' protocols with a known listing date (' + f.odds_with_token + ' of them record a token). Odds are ' + Math.round(f.odds_1y * 100) + '% at one year, ' + Math.round(f.odds_2y * 100) + '% at two years and ' + Math.round(f.odds_4y * 100) + '% at four years: older cohorts list more often, so an old protocol with no token sits in a cohort where listing is common.' }),
+      el('p', { class: 'note', text: 'Age pulls both ways: older listed tokens are worth less at the same TVL (the fitted age coefficient is ' + f.launch_age.toFixed(3) + '), but older cohorts list tokens more often. The net effect is shown per row in its detail view. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + f.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + f.unknown_age_days + ' days.' }),
+      el('p', { class: 'note', text: 'The snapshot carries no team, funding or points-program data, so the model cannot score them. Size still leads the top of the board, so the largest vaults and curators head it; the category filter is how a reader compares within one kind of protocol.' })
     );
   }
 
   function sandboxPanel() {
-    var m = DATA.model;
+    var f = DATA.fit;
     var box = el('div', { class: 'sandbox' });
-    var out = el('div', { class: 'sandbox-top' }, el('p', { class: 'note', text: 'Move a constant and the top 10 re-ranks below. The submitted board always uses the defaults above; this is a what-if, not a second board.' }));
+    var out = el('div', { class: 'sandbox-top' }, el('p', { class: 'note', text: 'Move a fitted coefficient and the top 10 re-ranks below. The submitted board always uses the fitted values above; this is a what-if, not a second board.' }));
     var grid = el('div', { class: 'sandbox-grid' });
     var current = {
-      size_power: m.size_power,
-      growth_weight: m.growth_weight,
-      maturity_peak_days: m.maturity_peak_days,
-      chain_bonus: m.chain_bonus,
+      launch_tvl: f.launch_tvl,
+      launch_age: f.launch_age,
+      launch_chains: f.launch_chains,
+      odds_age: f.odds_age,
     };
     function slider(key, label, min, max, step, fmt) {
       var output = el('output', { text: fmt(current[key]) });
@@ -362,20 +429,18 @@
       });
       grid.appendChild(el('div', { class: 'slider' }, el('label', null, el('span', { text: label }), output), input));
     }
-    slider('size_power', 'Size power (TVL exponent)', 0.3, 0.8, 0.05, function (v) { return v.toFixed(2); });
-    slider('growth_weight', 'Growth weight', 0, 1.2, 0.1, function (v) { return v.toFixed(1); });
-    slider('maturity_peak_days', 'Maturity peak (days)', 365, 1095, 15, function (v) { return String(Math.round(v)); });
-    slider('chain_bonus', 'Chain bonus (per extra chain)', 0, 0.1, 0.01, function (v) { return v.toFixed(2); });
+    slider('launch_tvl', 'Size elasticity (log10 TVL coefficient)', 0.2, 0.8, 0.01, function (v) { return v.toFixed(2); });
+    slider('launch_age', 'Age effect on launch value', -0.6, 0.2, 0.01, function (v) { return v.toFixed(2); });
+    slider('launch_chains', 'Chain bonus (per extra chain, log10)', 0, 0.08, 0.005, function (v) { return v.toFixed(3); });
+    slider('odds_age', 'Token-odds slope (log10 age coefficient)', 0, 3, 0.05, function (v) { return v.toFixed(2); });
     function refresh() {
-      var model = {
-        size_power: current.size_power, size_scale: m.size_scale,
-        growth_weight: current.growth_weight, growth_floor: m.growth_floor, growth_cap: m.growth_cap,
-        maturity_floor: m.maturity_floor, maturity_peak: m.maturity_peak,
-        maturity_peak_days: current.maturity_peak_days, maturity_spread_days: m.maturity_spread_days,
-        chain_bonus: current.chain_bonus, chain_bonus_cap: m.chain_bonus_cap,
-        derivative_discount: m.derivative_discount, unknown_age_days: m.unknown_age_days,
+      var fit = {
+        launch_intercept: f.launch_intercept, launch_tvl: current.launch_tvl,
+        launch_age: current.launch_age, launch_chains: current.launch_chains,
+        odds_intercept: f.odds_intercept, odds_age: current.odds_age,
+        derivative_discount: f.derivative_discount, unknown_age_days: f.unknown_age_days,
       };
-      var ranked = DATA.rows.map(function (r) { return { row: r, value: impliedOf(r, model) }; })
+      var ranked = DATA.rows.map(function (r) { return { row: r, value: impliedOf(r, fit) }; })
         .sort(function (a, b) { return b.value - a.value || (a.row.slug < b.row.slug ? -1 : 1); })
         .slice(0, 10);
       out.textContent = '';
@@ -419,7 +484,7 @@
     state.selected = slug;
     writeState();
     dialog.textContent = '';
-    var recomputed = impliedOf(row, DATA.model);
+    var recomputed = impliedOf(row, DATA.fit);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
         el('span', { class: 'brand-name', text: isDeriv ? 'Derivative ' + row.rank + ' of ' + DATA.derivative_size : 'Rank ' + row.rank + ' of ' + DATA.board_size + ' · clean launch' }),
@@ -432,11 +497,11 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Size value (TVL^power x scale)' }), el('b', { class: 'num', text: fmtUsd(row.size_value) })),
+        el('div', null, el('span', { text: 'Fitted launch value' }), el('b', { class: 'num', text: fmtUsd(row.launch_value) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
+        el('div', null, el('span', { text: 'Growth multiplier (fitted: no effect)' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(row.maturity_multiplier) })),
+        el('div', null, el('span', { text: 'Token odds (cohort rate)' }), el('b', { class: 'num', text: Math.round(row.odds * 100) + '%' })),
         el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: fmtMult(row.chain_multiplier) })),
         el('div', null, el('span', { text: 'Derivative multiplier' }), el('b', { class: 'num', text: fmtMult(row.derivative_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
@@ -472,7 +537,7 @@
     if (row.launch_type === 'derivative') {
       dialog.appendChild(el('section', { class: 'detail-section' },
         el('h3', { text: 'Why this is a derivative' }),
-        el('p', { class: 'sub', text: 'This protocol wraps, stakes or bridges another asset, or carries an exchange\u2019s name. Its token, if one ever comes, is the underlying\u2019s story, not a standalone launch: the model discounts it to ' + DATA.model.derivative_discount + ' and the farm plan still applies, but the allocation, if any, is likelier to follow the underlying.' })
+        el('p', { class: 'sub', text: 'This protocol wraps, stakes or bridges another asset, or carries an exchange\u2019s name. Its token, if one ever comes, is the underlying\u2019s story, not a standalone launch: the model discounts it to ' + DATA.fit.derivative_discount + ' and the farm plan still applies, but the allocation, if any, is likelier to follow the underlying.' })
       ));
     }
     if (typeof dialog.showModal === 'function') {

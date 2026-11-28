@@ -1,12 +1,12 @@
 // Token Radar's entrypoint (Node 22, standard library only).
 //
-// Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// pre-token protocol with the radar-2 model in lib/model.ts, and writes the entry's output:
+// Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the radar-3
+// model to the snapshot itself in lib/model.ts, and writes the entry's output:
 //
 //   /output/board.json     the ranked board (rows 1..N, implied value, farm plan per row)
 //   /output/data.js        the same board, compact, for the dashboard to read
 //   /output/dashboard/    this repository's dashboard/ (index.html, app.css, app.js)
-//   /output/screenshots/  this repository's screenshots/ (board, detail, filtered)
+//   /output/screenshots/  this repository's screenshots/ (board, detail, filtered, model)
 //   /output/dossier.json  the dossier the judge reads, built by the vendored make.fun library
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
@@ -67,7 +67,7 @@ if (!existsSync(inputFile)) {
 const out = flag('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar } = buildRadar(snapshot);
+const { board, radar, fit } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) fail(`the model wrote a board the gate refuses: ${issue}`);
 
@@ -90,5 +90,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols in, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live and ${radar.derivative_size} derivatives set aside)\n` +
+    `token radar: fitted launch log10(mcap) = ${fit.launch_intercept.toFixed(4)} + ${fit.launch_tvl.toFixed(4)} x log10(TVL) + ${fit.launch_age.toFixed(4)} x log10(age) + ${fit.launch_chains.toFixed(4)} x extra chains on ${fit.fit_n} traded tokens (R2 ${fit.fit_r2}, LOO x${fit.fit_loo_factor}, walk-forward x${fit.fit_wf_factor}); token odds logistic on ${fit.odds_n} protocols (1y ${fit.odds_1y}, 2y ${fit.odds_2y}, 4y ${fit.odds_4y})\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
