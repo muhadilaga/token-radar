@@ -7,11 +7,12 @@
 // renders these same numbers from data.js, and this comment states them so they read in
 // source as well as on screen:
 //   launch  = 10 ^ (4.330 + 0.432 x log10(TVL) - 0.227 x log10(age) + 0.018 x extra chains)
-//   odds    = 1 / (1 + exp(-(-3.936 + 1.447 x log10(age))))  — 1y 0.44, 2y 0.55, 4y 0.66
+//   odds    = (F(age + 365d) - F(age)) / (1 - F(age)), F = 1 / (1 + exp(-(-3.936 + 1.447 x log10(age))))
+//             — the 12-month forward hazard: 1y 0.19, 2y 0.14, 4y 0.09 (falls with age)
 //   implied = round(launch x odds x derivative); derivative discount 0.85, unknown age 365d
 //   Fit on 95 traded-token protocols: R² 0.18, leave-one-out error x4.54,
 //   walk-forward error x10.27 (train 66 oldest listings, test 29 newest).
-//   Odds fitted on 645 protocols, 327 with a token.
+//   Odds fitted on 645 protocols, 327 with a token; 5-fold Brier 0.23 vs 0.25 baseline.
 //   Seven-day growth was fitted (coefficient about -0.01, not significant) and constrained
 //   to zero: the model neither rewards nor punishes a single week's move.
 (function () {
@@ -61,14 +62,25 @@
   // snapshot figures and checks the number board.json carries, so the page's code and the
   // board's data are visibly the same arithmetic. The sandbox runs this with moved constants.
   // The fitted launch value is 10^(b0 + b1*log10(TVL) + b3*log10(age) + b4*extra chains),
-  // times the token odds from the fitted logistic curve on log10(age); growth was fitted
-  // and dropped (its effect is indistinguishable from zero), so it contributes nothing.
+  // times the 12-month forward hazard read off the fitted cohort curve: (F(age + 365d) -
+  // F(age)) / (1 - F(age)), where F is the logistic share of protocols of that age that
+  // record a token. Growth was fitted and dropped (its effect is indistinguishable from
+  // zero), so it contributes nothing.
+  function cohortShare(age, intercept, slope) {
+    return 1 / (1 + Math.exp(-(intercept + slope * Math.log10(Math.max(1, age)))));
+  }
+  function hazardOf(age, intercept, slope) {
+    var a = Math.max(1, age);
+    var fNow = cohortShare(a, intercept, slope);
+    var fNext = cohortShare(a + 365, intercept, slope);
+    return (fNext - fNow) / (1 - fNow);
+  }
   function impliedOf(row, fit) {
     var age = row.age_days === null || row.age_days === undefined ? fit.unknown_age_days : row.age_days;
     var ageFit = Math.min(Math.max(age, 1), 3650);
     var extra = Math.min(Math.max((row.chains || []).length - 1, 0), 10);
     var launch = Math.pow(10, fit.launch_intercept + fit.launch_tvl * Math.log10(row.tvl_usd) + fit.launch_age * Math.log10(ageFit) + fit.launch_chains * extra);
-    var odds = 1 / (1 + Math.exp(-(fit.odds_intercept + fit.odds_age * Math.log10(ageFit))));
+    var odds = hazardOf(ageFit, fit.odds_intercept, fit.odds_age);
     var derivMult = row.launch_type === 'derivative' ? fit.derivative_discount : 1;
     return Math.max(1, Math.round(launch * odds * derivMult));
   }
@@ -76,7 +88,7 @@
   function oddsOf(row, fit) {
     var age = row.age_days === null || row.age_days === undefined ? fit.unknown_age_days : row.age_days;
     var ageFit = Math.min(Math.max(age, 1), 3650);
-    return 1 / (1 + Math.exp(-(fit.odds_intercept + fit.odds_age * Math.log10(ageFit))));
+    return hazardOf(ageFit, fit.odds_intercept, fit.odds_age);
   }
 
   function launchOf(row, fit) {
@@ -387,13 +399,13 @@
     var f = DATA.fit;
     return el('section', { class: 'panel section' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'note', text: 'Every row is scored by one model FIT to this snapshot, not by hand-picked constants: the launch value is an OLS fit of log10(market cap) on the snapshot\u2019s traded-token protocols, and the token odds are a logistic fit of \u201Crecords a token\u201D on age. No protocol name is special-cased, and no row is hand-picked; live-token protocols are shown at market value, never ranked.' }),
+      el('p', { class: 'note', text: 'Every row is scored by one model FIT to this snapshot, not by hand-picked constants: the launch value is an OLS fit of log10(market cap) on the snapshot\u2019s traded-token protocols, and the token odds are the 12-month forward hazard read off a logistic fit of \u201Crecords a token\u201D on age. No protocol name is special-cased, and no row is hand-picked; live-token protocols are shown at market value, never ranked.' }),
       el('div', { class: 'formula' },
         el('b', { text: 'launch = 10 ^ ( ' }),
         f.launch_intercept.toFixed(3) + ' + ' + f.launch_tvl.toFixed(3) + ' x log10(TVL) + ' + f.launch_age.toFixed(3) + ' x log10(age) + ' + f.launch_chains.toFixed(3) + ' x extra chains',
         el('b', { text: ' )' }),
         el('br'),
-        el('b', { text: 'odds = 1 / (1 + exp(-( ' }),
+        el('b', { text: 'odds = ( F(age + 365d) - F(age) ) / ( 1 - F(age) ),  F(age) = 1 / (1 + exp(-( ' }),
         f.odds_intercept.toFixed(3) + ' + ' + f.odds_age.toFixed(3) + ' x log10(age)',
         el('b', { text: ' )))' }),
         el('br'),
@@ -402,8 +414,8 @@
       el('h2', { text: 'Model validation — as fitted, not as proof' }),
       el('p', { class: 'note', text: 'Launch fit: ' + f.fit_n + ' traded-token protocols carry the label (a positive market cap, a listing date and a reported seven-day growth figure; 15 zero-value tokens and the rest without a usable label are excluded). R\u00B2 = ' + f.fit_r2 + ' on the log10 scale. Leave-one-out error x' + f.fit_loo_factor + ' (one refit per protocol, tested on the held-out row). Walk-forward error x' + f.fit_wf_factor + ' (fit on the oldest ' + f.fit_wf_train + ' by listing date, tested on the newest ' + f.fit_wf_test + '). TVL is the only signal with real bite; the fit is shown because it is fitted, not because it is precise.' }),
       el('p', { class: 'note', text: 'Seven-day growth was fitted and dropped: its coefficient is indistinguishable from zero (t = -1.3) and flips sign across sample splits, so the model sets it to zero instead of letting sampling noise punish growing protocols. Growth is still shown for every row, and it still drives the farm plan\u2019s stop rule.' }),
-      el('p', { class: 'note', text: 'Token odds are a cohort rate, not a promise: the share of protocols of that age that record a token, fitted by logistic regression on ' + f.odds_n + ' protocols with a known listing date (' + f.odds_with_token + ' of them record a token). Odds are ' + Math.round(f.odds_1y * 100) + '% at one year, ' + Math.round(f.odds_2y * 100) + '% at two years and ' + Math.round(f.odds_4y * 100) + '% at four years: older cohorts list more often, so an old protocol with no token sits in a cohort where listing is common.' }),
-      el('p', { class: 'note', text: 'Age pulls both ways: older listed tokens are worth less at the same TVL (the fitted age coefficient is ' + f.launch_age.toFixed(3) + '), but older cohorts list tokens more often. The net effect is shown per row in its detail view. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + f.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + f.unknown_age_days + ' days.' }),
+      el('p', { class: 'note', text: 'Token odds are a 12-month forward hazard, not a promise: among protocols still tokenless at a given age, the share the fitted cohort curve says lists within the next 12 months. The curve is a logistic fit of \u201Crecords a token\u201D on age over ' + f.odds_n + ' protocols with a known listing date (' + f.odds_with_token + ' of them record a token). Odds are ' + Math.round(f.odds_1y * 100) + '% at one year, ' + Math.round(f.odds_2y * 100) + '% at two years and ' + Math.round(f.odds_4y * 100) + '% at four years: the longer a protocol sits tokenless, the less likely it is to list soon. Held-out check: 5-fold Brier ' + f.odds_brier_kfold + ' against a ' + f.odds_brier_baseline + ' baseline (predicting the overall token rate) \u2014 a real but modest signal.' }),
+      el('p', { class: 'note', text: 'Age pulls the same way twice: older listed tokens are worth less at the same TVL (the fitted age coefficient is ' + f.launch_age.toFixed(3) + '), and older tokenless protocols are less likely to list soon (the hazard falls with age). The net effect is shown per row in its detail view. A wrapped, staked or bridged product is flagged as a derivative and discounted to ' + f.derivative_discount + ', because its launch is its underlying\u2019s, not its own; derivatives are scored the same way and listed separately, never ranked with clean launches. Age is the time since first listing; an unlisted age uses ' + f.unknown_age_days + ' days.' }),
       el('p', { class: 'note', text: 'The snapshot carries no team, funding or points-program data, so the model cannot score them. Size still leads the top of the board, so the largest vaults and curators head it; the category filter is how a reader compares within one kind of protocol.' })
     );
   }
@@ -432,7 +444,7 @@
     slider('launch_tvl', 'Size elasticity (log10 TVL coefficient)', 0.2, 0.8, 0.01, function (v) { return v.toFixed(2); });
     slider('launch_age', 'Age effect on launch value', -0.6, 0.2, 0.01, function (v) { return v.toFixed(2); });
     slider('launch_chains', 'Chain bonus (per extra chain, log10)', 0, 0.08, 0.005, function (v) { return v.toFixed(3); });
-    slider('odds_age', 'Token-odds slope (log10 age coefficient)', 0, 3, 0.05, function (v) { return v.toFixed(2); });
+    slider('odds_age', 'Token-odds slope (log10 age coefficient)', 0.5, 3, 0.05, function (v) { return v.toFixed(2); });
     function refresh() {
       var fit = {
         launch_intercept: f.launch_intercept, launch_tvl: current.launch_tvl,
@@ -501,7 +513,7 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier (fitted: no effect)' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Token odds (cohort rate)' }), el('b', { class: 'num', text: Math.round(row.odds * 100) + '%' })),
+        el('div', null, el('span', { text: 'Token odds (12-month hazard)' }), el('b', { class: 'num', text: Math.round(row.odds * 100) + '%' })),
         el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: fmtMult(row.chain_multiplier) })),
         el('div', null, el('span', { text: 'Derivative multiplier' }), el('b', { class: 'num', text: fmtMult(row.derivative_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))

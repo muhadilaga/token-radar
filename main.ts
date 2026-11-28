@@ -90,6 +90,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols in, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live and ${radar.derivative_size} derivatives set aside)\n` +
-    `token radar: fitted launch log10(mcap) = ${fit.launch_intercept.toFixed(4)} + ${fit.launch_tvl.toFixed(4)} x log10(TVL) + ${fit.launch_age.toFixed(4)} x log10(age) + ${fit.launch_chains.toFixed(4)} x extra chains on ${fit.fit_n} traded tokens (R2 ${fit.fit_r2}, LOO x${fit.fit_loo_factor}, walk-forward x${fit.fit_wf_factor}); token odds logistic on ${fit.odds_n} protocols (1y ${fit.odds_1y}, 2y ${fit.odds_2y}, 4y ${fit.odds_4y})\n` +
+    `token radar: fitted launch log10(mcap) = ${fit.launch_intercept.toFixed(4)} + ${fit.launch_tvl.toFixed(4)} x log10(TVL) + ${fit.launch_age.toFixed(4)} x log10(age) + ${fit.launch_chains.toFixed(4)} x extra chains on ${fit.fit_n} traded tokens (R2 ${fit.fit_r2}, LOO x${fit.fit_loo_factor}, walk-forward x${fit.fit_wf_factor}); token odds 12-month hazard from a logistic fit on ${fit.odds_n} protocols (1y ${fit.odds_1y}, 2y ${fit.odds_2y}, 4y ${fit.odds_4y}; 5-fold Brier ${fit.odds_brier_kfold} vs ${fit.odds_brier_baseline} baseline)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

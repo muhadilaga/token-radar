@@ -17,14 +17,15 @@
 //     printed in the dashboard, as fitted, not as proof of precision: TVL is the only
 //     signal with real bite (R-squared 0.18), and the page says so.
 //
-//   token odds   = 1 / (1 + exp(-(c0 + c1 x log10(age))))
-//     A logistic fit of "records a token" on log10(age) over every protocol with a known
-//     listing date. It is a COHORT rate, not a promise: the share of protocols of that age
-//     that record a token (44% at one year, 55% at two, 66% at four). Older cohorts list
-//     more often, so an old protocol with no token sits in a cohort where listing is
-//     common. Age pulls both ways: older listed tokens are worth less at the same TVL
-//     (b3 is negative), but older cohorts list tokens more often. The net effect is
-//     shown per row.
+//   token odds   = (F(age + 365d) - F(age)) / (1 - F(age)),  F(age) = 1 / (1 + exp(-(c0 + c1 x log10(age))))
+//     A 12-month forward HAZARD, not a cohort share: among protocols still tokenless at
+//     a given age, the share the fitted cohort curve says lists within the next 12 months.
+//     The hazard FALLS with age (19% at one year, 14% at two, 9% at four): the longer a
+//     protocol sits tokenless, the less likely it is to list soon. Age pulls the same
+//     way twice: older listed tokens are worth less at the same TVL (b3 is negative),
+//     and older tokenless protocols are less likely to list soon. The net effect is
+//     shown per row. A single snapshot cannot show future listings, so the hazard is
+//     the cohort curve read forward, under stationary listing propensity.
 //
 //   implied      = max(1, round(launch value x token odds x derivative discount))
 //
@@ -74,7 +75,7 @@ export interface FittedModel {
   launch_tvl: number;
   launch_age: number;
   launch_chains: number;
-  /** logit P(records a token) = odds_intercept + odds_age x log10(age). */
+  /** The cohort curve underneath the hazard: F(age) = 1 / (1 + exp(-(odds_intercept + odds_age x log10(age)))), the fitted share of protocols of that age that record a token. */
   odds_intercept: number;
   odds_age: number;
   derivative_discount: number;
@@ -92,10 +93,13 @@ export interface FittedModel {
   /** Protocols with a known listing date the odds fit used, and how many of them record a token. */
   odds_n: number;
   odds_with_token: number;
-  /** Token odds at one, two and four years, from the fitted logistic curve. */
+  /** Token odds at one, two and four years: the 12-month forward hazard (F(age + 365d) - F(age)) / (1 - F(age)). Monotone decreasing in age. */
   odds_1y: number;
   odds_2y: number;
   odds_4y: number;
+  /** Held-out validation of the odds fit: mean 5-fold Brier score of the cohort curve (deterministic folds, row index mod 5), and the baseline Brier of predicting the overall token rate. */
+  odds_brier_kfold: number;
+  odds_brier_baseline: number;
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
@@ -347,10 +351,51 @@ function launchFeatures(protocol: SnapshotProtocol, asOf: string, unknownAgeDays
   return [1, Math.log10(protocol.tvl_usd), Math.log10(ageForFit(ageDays(asOf, protocol.listed_at), unknownAgeDays)), extraChains(protocol)];
 }
 
-/** The token odds for an age in days, from a fitted logistic curve. */
-function tokenOdds(age: number, oddsIntercept: number, oddsAge: number): number {
+/** The fitted cohort share at an age in days: the share of protocols of that age that record a token. */
+function cohortShare(age: number, oddsIntercept: number, oddsAge: number): number {
   const z = oddsIntercept + oddsAge * Math.log10(Math.max(1, age));
   return 1 / (1 + Math.exp(-z));
+}
+
+/**
+ * The token odds for an age in days: the 12-month forward hazard, (F(age + 365d) - F(age)) / (1 - F(age)).
+ * Among protocols still tokenless at this age, the share the fitted cohort curve says lists
+ * within the next 12 months. It falls with age because the cohort curve flattens: each extra
+ * year adds fewer newly-tokened protocols than the year before, while the tokenless pool it
+ * divides by shrinks more slowly. A single snapshot cannot show future listings, so the
+ * hazard is the cohort curve read forward, under stationary listing propensity.
+ */
+function tokenOdds(age: number, oddsIntercept: number, oddsAge: number): number {
+  const a = Math.max(1, age);
+  const fNow = cohortShare(a, oddsIntercept, oddsAge);
+  const fNext = cohortShare(a + 365, oddsIntercept, oddsAge);
+  return (fNext - fNow) / (1 - fNow);
+}
+
+/** Logistic fit of a binary outcome on [1, log10(age)] by Newton iterations from zero (deterministic). */
+function fitLogistic(xs: number[][], ys: number[]): number[] {
+  let w = [0, 0];
+  for (let iter = 0; iter < 100; iter++) {
+    const grad = [0, 0];
+    const hess = [
+      [0, 0],
+      [0, 0],
+    ];
+    for (let i = 0; i < xs.length; i++) {
+      const z = xs[i]![0]! * w[0]! + xs[i]![1]! * w[1]!;
+      const pr = 1 / (1 + Math.exp(-z));
+      const d = ys[i]! - pr;
+      const v = pr * (1 - pr);
+      for (let a = 0; a < 2; a++) {
+        grad[a]! += xs[i]![a]! * d;
+        for (let b = 0; b < 2; b++) hess[a]![b]! += xs[i]![a]! * xs[i]![b]! * v;
+      }
+    }
+    const step = solveLinear(hess, grad);
+    w = [w[0]! + step[0]!, w[1]! + step[1]!];
+    if (Math.max(Math.abs(step[0]!), Math.abs(step[1]!)) < 1e-12) break;
+  }
+  return w;
 }
 
 /**
@@ -364,11 +409,15 @@ function tokenOdds(age: number, oddsIntercept: number, oddsAge: number): number 
  * punish growing protocols.
  *
  * Token odds: a logistic fit of "records a token" on log10(age) over every protocol with
- * a known listing date, by Newton iterations from zero (deterministic).
+ * a known listing date, by Newton iterations from zero (deterministic). The odds factor
+ * itself is the 12-month forward hazard read off that curve, not the cohort share.
  *
  * Validation is held out and honest: R-squared on the log10 scale, a walk-forward split
  * (fit on the oldest 70% by listing date, tested on the newest 30%) and leave-one-out
- * refits, each reported as an error factor (10 to the mean absolute log10 error).
+ * refits, each reported as an error factor (10 to the mean absolute log10 error). The
+ * odds fit is validated by 5-fold Brier score (deterministic folds): a time split by
+ * listing date is not a fair held-out test for an age-only model, because listing date
+ * and age are the same axis — the train set would hold no young protocols at all.
  */
 export function fitModel(snapshot: Snapshot): FittedModel {
   const unknownAgeDays = FIT_DEFAULTS.unknown_age_days;
@@ -431,27 +480,31 @@ export function fitModel(snapshot: Snapshot): FittedModel {
   const oddsRows = snapshot.protocols.filter((p) => p.listed_at !== null);
   const oddsX = oddsRows.map((p) => [1, Math.log10(Math.max(1, ageDays(snapshot.as_of, p.listed_at) ?? unknownAgeDays))]);
   const oddsY = oddsRows.map((p) => (isPreToken(p) ? 0 : 1));
-  let w = [0, 0];
-  for (let iter = 0; iter < 100; iter++) {
-    const grad = [0, 0];
-    const hess = [
-      [0, 0],
-      [0, 0],
-    ];
+  const w = fitLogistic(oddsX, oddsY);
+  // Held-out validation of the odds fit: 5-fold Brier score, deterministic folds
+  // (fold = row index mod 5 in snapshot order). A time split by listing date would
+  // truncate the age range the train fit sees, so it is not a fair test here.
+  const oddsRate = oddsY.reduce((s, v) => s + v, 0) / oddsY.length;
+  let oddsBrier = 0;
+  for (let fold = 0; fold < 5; fold++) {
+    const trainX: number[][] = [];
+    const trainY: number[] = [];
+    const testIdx: number[] = [];
     for (let i = 0; i < oddsRows.length; i++) {
-      const z = oddsX[i]![0]! * w[0]! + oddsX[i]![1]! * w[1]!;
-      const pr = 1 / (1 + Math.exp(-z));
-      const d = oddsY[i]! - pr;
-      const v = pr * (1 - pr);
-      for (let a = 0; a < 2; a++) {
-        grad[a]! += oddsX[i]![a]! * d;
-        for (let b = 0; b < 2; b++) hess[a]![b]! += oddsX[i]![a]! * oddsX[i]![b]! * v;
+      if (i % 5 === fold) testIdx.push(i);
+      else {
+        trainX.push(oddsX[i]!);
+        trainY.push(oddsY[i]!);
       }
     }
-    const step = solveLinear(hess, grad);
-    w = [w[0]! + step[0]!, w[1]! + step[1]!];
-    if (Math.max(Math.abs(step[0]!), Math.abs(step[1]!)) < 1e-12) break;
+    const wf = fitLogistic(trainX, trainY);
+    for (const i of testIdx) {
+      const pr = 1 / (1 + Math.exp(-(wf[0]! + wf[1]! * oddsX[i]![1]!)));
+      oddsBrier += (pr - oddsY[i]!) ** 2;
+    }
   }
+  oddsBrier /= oddsRows.length;
+  const oddsBrierBaseline = oddsY.reduce((s, v) => s + (oddsRate - v) ** 2, 0) / oddsY.length;
   return {
     launch_intercept: beta[0]!,
     launch_tvl: beta[1]!,
@@ -472,6 +525,8 @@ export function fitModel(snapshot: Snapshot): FittedModel {
     odds_1y: round4(tokenOdds(365, w[0]!, w[1]!)),
     odds_2y: round4(tokenOdds(730, w[0]!, w[1]!)),
     odds_4y: round4(tokenOdds(1460, w[0]!, w[1]!)),
+    odds_brier_kfold: round4(oddsBrier),
+    odds_brier_baseline: round4(oddsBrierBaseline),
   };
 }
 
@@ -905,7 +960,7 @@ function whySentence(
   const category = row.category ?? 'Other';
   if (ctx.dominant === 'age' && row.age_days !== null) {
     const oddsPct = Math.round(row.model.odds * 100);
-    return `Age carries this rank: ${fmtAgeShort(row.age_days)} with no token puts this protocol in a cohort where ${oddsPct}% record a token, on ${tvl} of TVL.`;
+    return `Age carries this rank: ${fmtAgeShort(row.age_days)} with no token, and the fitted 12-month hazard is ${oddsPct}% — the share of protocols still tokenless at this age that list within the next year, on ${tvl} of TVL.`;
   }
   if (ctx.dominant === 'chain' && row.chains.length > 1) {
     return `Breadth carries this rank: ${row.chains.length} chains lift the value by x${row.model.chain_multiplier.toFixed(2)}, on ${tvl} of TVL.`;
